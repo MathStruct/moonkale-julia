@@ -9,3 +9,6 @@ Notes for `moonkale-ext-lux` (Milestone 6): the **Lux.jl block library** for the
 - Tests: a CNN flow generates the expected layers; a wrong graph reports its block; `generated_file_parses_in_julia` runs `julia -e 'Meta.parseall(read(...))'` when `julia` is on PATH (1.12 here; `Lux` itself is not installed, so running is a user action).
 
 Next: an MTK / data-pipeline library as a second contribution, execute-in-place through the terminal with output back into the flow.
+
+## Milestone 18 phase 6.4 — its own repository
+Moved from `MathStruct/Moonkale` (`packages/extensions/lux`, history kept with `git subtree split`) to `MathStruct/moonkale-julia` on 2026-10-03. Depends on `moonkale-ext-api` by git tag `lib-v1`; Moonkale's distribution pulls it by git behind the off-by-default feature `julia`, and patches `moonkale-ext-api` to its own path so both sides share one copy of the contract types.
