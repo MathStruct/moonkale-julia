@@ -29,8 +29,10 @@ fn param<'a>(b: &'a Block, name: &str, default: &'a str) -> &'a str {
 fn num(b: &Block, name: &str, default: &str) -> Result<String, String> {
     let v = param(b, name, default).trim();
     v.parse::<f64>()
+        .ok()
+        .filter(|f| f.is_finite())
         .map(|_| v.to_string())
-        .map_err(|_| format!("{}.{} = {v:?} is not a number", b.id, name))
+        .ok_or(format!("{}.{} = {v:?} is not a number", b.id, name))
 }
 
 /// The block kind without its `mtk/` prefix.
@@ -203,23 +205,40 @@ pub fn generate(flow: &Flow, lib: &FlowLibrary) -> Result<Generated, String> {
         return Err("the circuit has no connections".into());
     }
 
-    // The state: a capacitor's v, an inductor's i, a mass's v — all at 0.
+    // The state and its initial conditions: a capacitor's v (0), an
+    // inductor's i (0), a mass's s and v (s from its s0, v at 0), a
+    // spring's elongation delta_s (from its s0 — a released mass needs
+    // it consistent with the mass's s0, or the initialization is
+    // underdetermined and the system does not move). A damper has no
+    // state of its own.
     let mut u0 = Vec::new();
     let mut prints = Vec::new();
+    let sample = |name: &str, state: &str, prints: &mut Vec<String>| {
+        for t in ["0.5", "1.0", "5.0"] {
+            prints.push(format!(
+                "println(\"{name}.{state} at t={t}: \", sol({t}; idxs = {name}.{state}))"
+            ));
+        }
+    };
     for b in &flow.blocks {
         let name = &name_of[b.id.as_str()];
         match kind(&prefix, b) {
-            "capacitor" | "mass" => {
+            "capacitor" => {
                 u0.push(format!("{name}.v => 0.0"));
-                prints.push(format!(
-                    "println(\"{name}.v at t=5.0: \", sol(5.0; idxs = {name}.v))"
-                ));
+                sample(name, "v", &mut prints);
             }
             "inductor" => {
                 u0.push(format!("{name}.i => 0.0"));
-                prints.push(format!(
-                    "println(\"{name}.i at t=5.0: \", sol(5.0; idxs = {name}.i))"
-                ));
+                sample(name, "i", &mut prints);
+            }
+            "mass" => {
+                u0.push(format!("{name}.s => {}", num(b, "s0", "0.0")?));
+                u0.push(format!("{name}.v => 0.0"));
+                sample(name, "s", &mut prints);
+                sample(name, "v", &mut prints);
+            }
+            "spring" => {
+                u0.push(format!("{name}.delta_s => {}", num(b, "s0", "0.0")?));
             }
             _ => {}
         }
@@ -237,7 +256,7 @@ pub fn generate(flow: &Flow, lib: &FlowLibrary) -> Result<Generated, String> {
          # Run: julia circuit.jl (needs ModelingToolkit, its StandardLibrary and OrdinaryDiffEq).\n\
          using ModelingToolkit\n\
          using ModelingToolkitStandardLibrary.Electrical\n\
-         using ModelingToolkitStandardLibrary.Mechanical\n\
+         using ModelingToolkitStandardLibrary.Mechanical.Translational\n\
          using ModelingToolkitStandardLibrary.Blocks\n\
          using OrdinaryDiffEq\n\
          \n\
@@ -276,7 +295,7 @@ mod tests {
     use super::*;
     use moonkale_ext_api::flow::{Block, Wire};
 
-    fn rc() -> (Flow, FlowLibrary) {
+    pub(super) fn rc() -> (Flow, FlowLibrary) {
         let mut f = Flow::new();
         f.blocks = vec![
             Block {
@@ -404,6 +423,92 @@ mod tests {
             to_port: "p".into(),
         });
         assert!(generate(&bad, &lib).unwrap_err().contains("is not a pin"));
+    }
+
+    #[test]
+    fn a_released_mass_oscillates_in_the_generated_problem() {
+        // RC + a spring-mass in one circuit: the Translational import, the
+        // flange pins, and the initial conditions that make the mass move —
+        // s from the mass's s0, delta_s from the spring's (Claude's #1-3).
+        let (f, lib) = rc();
+        let mut mixed = f;
+        mixed.blocks.push(Block {
+            id: "wall".into(),
+            kind: "mtk/fixed".into(),
+            x: 4.0,
+            y: 0.0,
+            params: Default::default(),
+        });
+        mixed.blocks.push(Block {
+            id: "spr".into(),
+            kind: "mtk/spring".into(),
+            x: 5.0,
+            y: 0.0,
+            params: [
+                ("k".to_string(), "100.0".to_string()),
+                ("s0".to_string(), "0.1".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        });
+        mixed.blocks.push(Block {
+            id: "ms".into(),
+            kind: "mtk/mass".into(),
+            x: 6.0,
+            y: 0.0,
+            params: [
+                ("m".to_string(), "1.0".to_string()),
+                ("s0".to_string(), "0.1".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        });
+        mixed.wires.push(Wire {
+            id: "w5".into(),
+            from_block: "wall".into(),
+            from_port: "flange".into(),
+            to_block: "spr".into(),
+            to_port: "flange_a".into(),
+        });
+        mixed.wires.push(Wire {
+            id: "w6".into(),
+            from_block: "spr".into(),
+            from_port: "flange_b".into(),
+            to_block: "ms".into(),
+            to_port: "flange".into(),
+        });
+        let g = generate(&mixed, &lib).unwrap();
+        assert!(g
+            .text
+            .contains("using ModelingToolkitStandardLibrary.Mechanical.Translational"));
+        assert!(g
+            .text
+            .contains("connect(fixed_1.flange, spring_1.flange_a),"));
+        assert!(g
+            .text
+            .contains("connect(spring_1.flange_b, mass_1.flange),"));
+        // The initial conditions: the mass's position and the spring's
+        // elongation from their s0 — without both, MTK leaves the mass still.
+        assert!(g.text.contains("prob = ODEProblem(circuit, [capacitor_1.v => 0.0, spring_1.delta_s => 0.1, mass_1.s => 0.1, mass_1.v => 0.0], (0.0, 5.0))"));
+        assert!(g.text.contains("sol(0.5; idxs = mass_1.v)"));
+    }
+
+    #[test]
+    fn non_finite_parameters_are_refused() {
+        // Rust's f64 parse accepts inf and NaN; Julia must not see them
+        // (the MTK review's #4).
+        let (f, lib) = rc();
+        let mut bad = f;
+        bad.blocks[1]
+            .params
+            .insert("R".to_string(), "inf".to_string());
+        let err = generate(&bad, &lib).unwrap_err();
+        assert!(err.contains("is not a number"), "{err}");
+        bad.blocks[1]
+            .params
+            .insert("R".to_string(), "NaN".to_string());
+        let err = generate(&bad, &lib).unwrap_err();
+        assert!(err.contains("is not a number"), "{err}");
     }
 
     #[test]
