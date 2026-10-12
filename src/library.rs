@@ -31,6 +31,9 @@ fn block(
     outputs: Vec<Port>,
     params: Vec<Param>,
 ) -> BlockKind {
+    // `..Default::default()` keeps future BlockKind fields non-breaking —
+    // the pins review's #2: a new field needs no ext-api tag release in
+    // lockstep with this library.
     BlockKind {
         id: id.into(),
         name: name.into(),
@@ -39,6 +42,7 @@ fn block(
         inputs,
         outputs,
         params,
+        ..Default::default()
     }
 }
 
