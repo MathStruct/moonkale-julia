@@ -38,6 +38,7 @@ fn block(
         description: description.into(),
         inputs,
         outputs,
+        connections: vec![],
         params,
     }
 }

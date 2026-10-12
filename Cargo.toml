@@ -10,4 +10,4 @@ repository = "https://github.com/MathStruct/moonkale-julia"
 dioxus = "0.7.10"
 # Moonkale's extension contract, by git tag (never a branch): `lib-vN` marks
 # a compatible state of moonkale-core / moonkale-ext-api / moonkale-graph-render.
-moonkale-ext-api = { git = "https://github.com/MathStruct/Moonkale", tag = "lib-v1" }
+moonkale-ext-api = { git = "https://github.com/MathStruct/Moonkale", tag = "lib-v2" }
