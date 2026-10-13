@@ -2,8 +2,19 @@
 //! (blocks in topological order along the wires); everything else is
 //! reported as an error so a half-wired flow never produces a silently wrong
 //! file.
+//!
+//! A subflow block in the chain is a sub-`Chain` (ADR-0021 §6): the inner
+//! layer path splices between the boundary input and the boundary
+//! output — exactly one of each, because a chain has one path — and
+//! nested subflows recurse. Only layers may sit inside; a Loss or an
+//! Optimiser there is an error, not a layer.
 
-use moonkale_ext_api::flow::{Block, Flow, FlowLibrary, Generated};
+use moonkale_ext_api::flow::{Block, Flow, FlowLibrary, Generated, Subflow};
+
+/// The boundary pseudo-block id prefix (ADR-0021 §3), as in
+/// `mtk_codegen.rs` — ext-api's own `flow::BOUNDARY` is still above
+/// the tag this crate pins.
+const BOUNDARY: &str = "boundary/";
 
 fn param<'a>(b: &'a Block, name: &str, default: &'a str) -> &'a str {
     b.params.get(name).map(|s| s.as_str()).unwrap_or(default)
@@ -15,6 +26,171 @@ fn num(b: &Block, name: &str, default: &str) -> Result<String, String> {
     v.parse::<f64>()
         .map(|_| v.to_string())
         .map_err(|_| format!("{}.{name} = {v:?} is not a number", b.id))
+}
+
+/// The chain's running shape: the input features or channels the next
+/// layer sees (whatever the last layer left behind).
+struct ChainState {
+    in_features: Option<String>,
+    in_channels: Option<String>,
+}
+
+/// One block's layer, spliced into `layers`, updating the running
+/// shape. Only layer kinds belong here; a chain ender (Loss,
+/// Optimiser) or an unknown kind is an error — the outer walk handles
+/// the chain's own ending.
+fn emit_layer(
+    b: &Block,
+    prefix: &str,
+    st: &mut ChainState,
+    layers: &mut Vec<String>,
+) -> Result<(), String> {
+    let kind = b.kind.strip_prefix(prefix).unwrap_or(&b.kind);
+    match kind {
+        "dense" => {
+            let out = num(b, "out", "128")?;
+            let act = param(b, "activation", "relu");
+            let inp = st.in_features.clone().ok_or_else(|| {
+                format!(
+                    "{}: input size unknown — put a Flatten before a Dense after image layers",
+                    b.id
+                )
+            })?;
+            layers.push(format!("Dense({inp} => {out}, {act})"));
+            st.in_features = Some(out);
+        }
+        "conv" => {
+            let ch = num(b, "channels", "16")?;
+            let k = num(b, "kernel", "3")?;
+            let pad = num(b, "pad", "1")?;
+            let act = param(b, "activation", "relu");
+            let inp = st
+                .in_channels
+                .clone()
+                .ok_or_else(|| format!("{}: channel count unknown", b.id))?;
+            layers.push(format!("Conv(({k}, {k}), {inp} => {ch}, {act}; pad={pad})"));
+            st.in_channels = Some(ch);
+            st.in_features = None;
+        }
+        "maxpool" => {
+            let k = num(b, "kernel", "2")?;
+            layers.push(format!("MaxPool(({k}, {k}))"));
+        }
+        "flatten" => {
+            layers.push("FlattenLayer()".into());
+            // Features after flatten depend on the spatial size; let Lux
+            // infer them lazily.
+            st.in_features = Some("Lux.NoInputSize".into());
+        }
+        "dropout" => layers.push(format!("Dropout({})", num(b, "p", "0.5")?)),
+        "batchnorm" => {
+            let ch = st
+                .in_channels
+                .clone()
+                .or(st.in_features.clone())
+                .ok_or("BatchNorm: size unknown")?;
+            layers.push(format!("BatchNorm({ch})"));
+        }
+        other => {
+            return Err(format!(
+                "{}: block kind {other} cannot be part of the chain",
+                b.id
+            ))
+        }
+    }
+    Ok(())
+}
+
+/// Splice a subflow block's inner path into the chain (ADR-0021 §6):
+/// from the boundary input, block by block, until the boundary
+/// output. A nested subflow recurses.
+fn splice_subflow(
+    flow: &Flow,
+    sub: &Subflow,
+    prefix: &str,
+    st: &mut ChainState,
+    layers: &mut Vec<String>,
+    depth: usize,
+) -> Result<(), String> {
+    if depth > 16 {
+        return Err(format!("subflow {} nests too deep", sub.id));
+    }
+    // A chain has one path: one boundary input, one boundary output.
+    let (in_port, out_port) = match (sub.inputs.first(), sub.outputs.first()) {
+        (Some(i), Some(o)) if sub.inputs.len() == 1 && sub.outputs.len() == 1 => {
+            (i.name.clone(), o.name.clone())
+        }
+        _ => {
+            return Err(format!(
+                "subflow {} must declare exactly one input and one output to sit in a chain",
+                sub.id
+            ))
+        }
+    };
+    let first = sub
+        .wires
+        .iter()
+        .find(|w| w.from_block == format!("{BOUNDARY}{in_port}"));
+    // A pass-through subflow (input wired straight to output) splices
+    // nothing.
+    if first.is_some_and(|w| w.to_block == format!("{BOUNDARY}{out_port}")) {
+        return Ok(());
+    }
+    let mut cur = first
+        .and_then(|w| sub.blocks.iter().find(|b| b.id == w.to_block))
+        .ok_or_else(|| {
+            format!(
+                "subflow {} does not feed its boundary input {in_port}",
+                sub.id
+            )
+        })? as &Block;
+    let mut guard = 0;
+    loop {
+        guard += 1;
+        if guard > 256 {
+            return Err(format!(
+                "subflow {subid}: the inner path is too long",
+                subid = sub.id
+            ));
+        }
+        if let Some(nested) = &cur.subflow {
+            let sub = flow.subflow(nested).ok_or_else(|| {
+                format!(
+                    "{} references the subflow {nested}, which this document does not hold",
+                    cur.id
+                )
+            })?;
+            splice_subflow(flow, sub, prefix, st, layers, depth + 1)?;
+        } else {
+            emit_layer(cur, prefix, st, layers)?;
+        }
+        let wire = sub
+            .wires
+            .iter()
+            .find(|w| w.from_block == cur.id)
+            .ok_or_else(|| {
+                format!(
+                    "subflow {subid}: the path from {in_port} breaks at {}",
+                    cur.id,
+                    subid = sub.id
+                )
+            })?;
+        if wire.to_block == format!("{BOUNDARY}{out_port}") {
+            return Ok(());
+        }
+        cur = sub
+            .blocks
+            .iter()
+            .find(|b| b.id == wire.to_block)
+            .ok_or_else(|| {
+                format!(
+                    "subflow {subid}: {} wires to {} which the subflow does not hold",
+                    cur.id,
+                    wire.to_block,
+                    subid = sub.id
+                )
+            })?;
+    }
 }
 
 pub fn generate(flow: &Flow, lib: &FlowLibrary) -> Result<Generated, String> {
@@ -36,74 +212,40 @@ pub fn generate(flow: &Flow, lib: &FlowLibrary) -> Result<Generated, String> {
     let mut cur = next(input);
     let mut loss: Option<&Block> = None;
     let mut optimiser: Option<&Block> = None;
-    let mut in_features: Option<String> = shape_features(param(input, "shape", "28,28,1"));
-    let mut in_channels: Option<String> = shape_channels(param(input, "shape", "28,28,1"));
+    let mut st = ChainState {
+        in_features: shape_features(param(input, "shape", "28,28,1")),
+        in_channels: shape_channels(param(input, "shape", "28,28,1")),
+    };
     let mut guard = 0;
     while let Some(b) = cur {
         guard += 1;
         if guard > 256 {
             return Err("chain too long (cycle?)".into());
         }
-        match kind(b).as_str() {
-            "dense" => {
-                let out = num(b, "out", "128")?;
-                let act = param(b, "activation", "relu");
-                let inp = in_features.clone().ok_or_else(|| {
-                    format!(
-                        "{}: input size unknown — put a Flatten before a Dense after image layers",
-                        b.id
-                    )
-                })?;
-                layers.push(format!("Dense({inp} => {out}, {act})"));
-                in_features = Some(out);
-            }
-            "conv" => {
-                let ch = num(b, "channels", "16")?;
-                let k = num(b, "kernel", "3")?;
-                let pad = num(b, "pad", "1")?;
-                let act = param(b, "activation", "relu");
-                let inp = in_channels
-                    .clone()
-                    .ok_or_else(|| format!("{}: channel count unknown", b.id))?;
-                layers.push(format!("Conv(({k}, {k}), {inp} => {ch}, {act}; pad={pad})"));
-                in_channels = Some(ch);
-                in_features = None;
-            }
-            "maxpool" => {
-                let k = num(b, "kernel", "2")?;
-                layers.push(format!("MaxPool(({k}, {k}))"));
-            }
-            "flatten" => {
-                layers.push("FlattenLayer()".into());
-                // Features after flatten depend on the spatial size; let Lux
-                // infer them lazily.
-                in_features = Some("Lux.NoInputSize".into());
-            }
-            "dropout" => layers.push(format!("Dropout({})", num(b, "p", "0.5")?)),
-            "batchnorm" => {
-                let ch = in_channels
-                    .clone()
-                    .or(in_features.clone())
-                    .ok_or("BatchNorm: size unknown")?;
-                layers.push(format!("BatchNorm({ch})"));
-            }
-            "loss" => {
-                loss = Some(b);
-                cur = next(b);
-                if let Some(o) = cur {
-                    if kind(o) == "optimiser" {
-                        optimiser = Some(o);
-                    }
-                }
-                break;
-            }
-            other => {
-                return Err(format!(
-                    "{}: block kind {other} cannot be part of the chain",
+        // A subflow block is a sub-Chain: its inner path splices in
+        // between the boundary input and output (ADR-0021 §6).
+        if let Some(sub_id) = &b.subflow {
+            let sub = flow.subflow(sub_id).ok_or_else(|| {
+                format!(
+                    "{} references the subflow {sub_id}, which this document does not hold",
                     b.id
-                ))
-            }
+                )
+            })?;
+            splice_subflow(flow, sub, &prefix, &mut st, &mut layers, 0)?;
+            cur = next(b);
+            continue;
         }
+        if kind(b) == "loss" {
+            loss = Some(b);
+            cur = next(b);
+            if let Some(o) = cur {
+                if kind(o) == "optimiser" {
+                    optimiser = Some(o);
+                }
+            }
+            break;
+        }
+        emit_layer(b, &prefix, &mut st, &mut layers)?;
         cur = next(b);
     }
     let loss = loss.ok_or("the chain must end in a Loss block")?;
@@ -189,7 +331,7 @@ fn shape_channels(shape: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use moonkale_ext_api::flow::{Block, Wire};
+    use moonkale_ext_api::flow::{Block, Port, PortType, Subflow, Wire};
     use std::collections::BTreeMap;
 
     fn b(id: &str, kind: &str, params: &[(&str, &str)]) -> Block {
@@ -262,6 +404,184 @@ mod tests {
         f.blocks[1].params.insert("out".into(), "many".into());
         f.blocks[0].params.insert("shape".into(), "784".into());
         assert!(generate(&f, &lib).unwrap_err().contains("not a number"));
+    }
+    // ---- ADR-0021 stage C: the sub-Chain splice -------------------
+
+    #[test]
+    fn a_subflow_splices_its_inner_path_into_the_chain() {
+        let mut f = Flow::new();
+        f.subflows = vec![Subflow {
+            id: "encoder".into(),
+            name: "Encoder".into(),
+            // One path in, one path out — a chain has no branches.
+            inputs: vec![Port {
+                name: "x".into(),
+                ty: PortType::Any,
+                required: false,
+            }],
+            outputs: vec![Port {
+                name: "y".into(),
+                ty: PortType::Any,
+                required: false,
+            }],
+            connections: vec![],
+            blocks: vec![
+                Block {
+                    id: "conv-in".into(),
+                    kind: "lux/conv".into(),
+                    params: [
+                        ("channels".to_string(), "8".to_string()),
+                        ("kernel".to_string(), "3".to_string()),
+                        ("pad".to_string(), "1".to_string()),
+                        ("activation".to_string(), "relu".to_string()),
+                    ]
+                    .into_iter()
+                    .collect(),
+                    ..Default::default()
+                },
+                Block {
+                    id: "fl-in".into(),
+                    kind: "lux/flatten".into(),
+                    ..Default::default()
+                },
+            ],
+            wires: vec![
+                Wire {
+                    id: "sw1".into(),
+                    from_block: "boundary/x".into(),
+                    from_port: "x".into(),
+                    to_block: "conv-in".into(),
+                    to_port: "in".into(),
+                },
+                Wire {
+                    id: "sw2".into(),
+                    from_block: "conv-in".into(),
+                    from_port: "out".into(),
+                    to_block: "fl-in".into(),
+                    to_port: "in".into(),
+                },
+                Wire {
+                    id: "sw3".into(),
+                    from_block: "fl-in".into(),
+                    from_port: "out".into(),
+                    to_block: "boundary/y".into(),
+                    to_port: "y".into(),
+                },
+            ],
+        }];
+        // Input → the subsystem → Loss: the inner Conv and Flatten
+        // splice in where the subsystem sits.
+        f.blocks = vec![
+            Block {
+                id: "in1".into(),
+                kind: "lux/input".into(),
+                params: [("shape".to_string(), "28,28,1".to_string())]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
+            Block {
+                id: "sub".into(),
+                kind: "subflow".into(),
+                subflow: Some("encoder".into()),
+                ..Default::default()
+            },
+            Block {
+                id: "loss".into(),
+                kind: "lux/loss".into(),
+                ..Default::default()
+            },
+        ];
+        f.wires = vec![
+            Wire {
+                id: "w1".into(),
+                from_block: "in1".into(),
+                from_port: "out".into(),
+                to_block: "sub".into(),
+                to_port: "x".into(),
+            },
+            Wire {
+                id: "w2".into(),
+                from_block: "sub".into(),
+                from_port: "y".into(),
+                to_block: "loss".into(),
+                to_port: "prediction".into(),
+            },
+        ];
+        let lib = crate::library::library();
+        let out = generate(&f, &lib).expect("splices");
+        assert!(
+            out.text.contains("Conv((3, 3), 1 => 8, relu; pad=1)"),
+            "the inner Conv spliced in: {}",
+            out.text
+        );
+        assert!(
+            out.text.contains("FlattenLayer()"),
+            "the inner Flatten spliced in: {}",
+            out.text
+        );
+    }
+
+    #[test]
+    fn a_subflow_without_a_single_path_is_refused() {
+        let mut f = Flow::new();
+        f.subflows = vec![Subflow {
+            id: "two_ins".into(),
+            name: "Two inputs".into(),
+            inputs: vec![
+                Port {
+                    name: "a".into(),
+                    ty: PortType::Any,
+                    required: false,
+                },
+                Port {
+                    name: "b".into(),
+                    ty: PortType::Any,
+                    required: false,
+                },
+            ],
+            outputs: vec![],
+            connections: vec![],
+            blocks: vec![],
+            wires: vec![],
+        }];
+        f.blocks = vec![
+            Block {
+                id: "in1".into(),
+                kind: "lux/input".into(),
+                ..Default::default()
+            },
+            Block {
+                id: "sub".into(),
+                kind: "subflow".into(),
+                subflow: Some("two_ins".into()),
+                ..Default::default()
+            },
+            Block {
+                id: "loss".into(),
+                kind: "lux/loss".into(),
+                ..Default::default()
+            },
+        ];
+        f.wires = vec![
+            Wire {
+                id: "w1".into(),
+                from_block: "in1".into(),
+                from_port: "out".into(),
+                to_block: "sub".into(),
+                to_port: "a".into(),
+            },
+            Wire {
+                id: "w2".into(),
+                from_block: "sub".into(),
+                from_port: "b".into(),
+                to_block: "loss".into(),
+                to_port: "prediction".into(),
+            },
+        ];
+        let lib = crate::library::library();
+        let err = generate(&f, &lib).unwrap_err();
+        assert!(err.contains("exactly one input and one output"), "{err}");
     }
 }
 
