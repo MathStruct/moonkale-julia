@@ -196,12 +196,11 @@ mod tests {
         Block {
             id: id.into(),
             kind: format!("lux/{kind}"),
-            x: 0.0,
-            y: 0.0,
             params: params
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect::<BTreeMap<_, _>>(),
+            ..Default::default()
         }
     }
     fn w(a: &str, ap: &str, b: &str, bp: &str) -> Wire {
@@ -319,12 +318,11 @@ pub(crate) mod tests_support {
         let b = |id: &str, kind: &str, params: &[(&str, &str)]| Block {
             id: id.into(),
             kind: format!("lux/{kind}"),
-            x: 0.0,
-            y: 0.0,
             params: params
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect::<BTreeMap<_, _>>(),
+            ..Default::default()
         };
         let w = |a: &str, ap: &str, b: &str, bp: &str| Wire {
             id: format!("{a}-{b}"),
