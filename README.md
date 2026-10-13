@@ -1,6 +1,11 @@
 # moonkale-julia
 
-Julia for [Moonkale](https://github.com/MathStruct/Moonkale) — today one crate, **`moonkale-ext-lux`**: a [Lux.jl](https://lux.csail.mit.edu) block library for Moonkale's flow editor. Layers (`Dense`, `Conv`, `MaxPool`, `Flatten`, `Dropout`, `BatchNorm`), activations, an input, a loss and an optimiser, with tensor-shape ports (a shape mismatch is a red wire), and code generation to a Julia file (`Lux.Chain(…)` plus a training scaffold) that runs with `julia model.jl`.
+Julia for [Moonkale](https://github.com/MathStruct/Moonkale) — today one crate, **`moonkale-ext-lux`**, with two block libraries for Moonkale's flow editor:
+
+- **Lux.jl** ([lux.csail.mit.edu](https://lux.csail.mit.edu)): layers (`Dense`, `Conv`, `MaxPool`, `Flatten`, `Dropout`, `BatchNorm`), activations, an input, a loss and an optimiser, with tensor-shape ports (a shape mismatch is a red wire), and code generation to a Julia file (`Lux.Chain(…)` plus a training scaffold) that runs with `julia model.jl`.
+- **ModelingToolkit** (since v0.2.0): acausal, domain-typed components — Resistor, Capacitor, Inductor, Voltage, Ground; Mass, Spring, Damper, Fixed — and code generation to `circuit.jl`: `@named` components, one `connect` per net, `structural_simplify` and a solved ODE problem.
+
+Both generators understand **subflows** (since v0.3.0, Moonkale ADR-0021): an MTK subsystem flattens into the parent circuit, its components named per instance (`rc_filter_1_resistor_1`) and its boundary pins merging the inner and outer nets; a Lux subflow with one input and one output splices its layer path into the parent `Chain`.
 
 It lived in the Moonkale repository as `packages/extensions/lux` until Milestone 18 (phase 6.4): it is what its author needs, and for everyone else an opt-in extension, so it is off by default and built only when asked for.
 
@@ -14,10 +19,10 @@ cd packages/desktop && dx serve --features julia      # or: cargo build -p deskt
 cd packages/web && dx serve --features julia
 ```
 
-then switch it on in **Settings → Extensions → Lux.jl library**; the flow editor's palette gets the Lux blocks, and **Generate** writes the Julia file. The generated code needs `Lux`, `Optimisers`, `Zygote` and `Random` in your Julia environment; the extension itself has no Julia dependency.
+then switch it on in **Settings → Extensions → Lux.jl library**; the flow editor's palette gets the Lux blocks, and **Generate** writes the Julia file. The generated Lux code needs `Lux`, `Optimisers`, `Zygote` and `Random` in your Julia environment, the circuit `ModelingToolkit`, `ModelingToolkitStandardLibrary` and `OrdinaryDiffEq`; the extension itself has no Julia dependency.
 
 ## Developing it
 
-It depends on Moonkale's extension contract by **git tag** (`lib-v1`; see Moonkale's `packages/ext-api/CHANGELOG.md`), so `cargo test` here builds against that tag. To work on both at once, point Moonkale's distribution at a local checkout (`[patch."https://github.com/MathStruct/moonkale-julia"]` in Moonkale's `Cargo.toml`).
+It depends on Moonkale's extension contract by **git tag** (`ext-api-YYYY-MM-DD`, today `ext-api-2026-10-13`; see Moonkale's `packages/ext-api/CHANGELOG.md`), so `cargo test` here builds against that tag. To work on both at once, point Moonkale's distribution at a local checkout (`[patch."https://github.com/MathStruct/moonkale-julia"]` in Moonkale's `Cargo.toml`).
 
 Notes on the code: `lux.md`. License: MIT.
