@@ -302,29 +302,28 @@ mod tests {
                 id: "src-aa".into(),
                 kind: "mtk/voltage".into(),
                 x: 0.0,
-                y: 0.0,
                 params: [("V".to_string(), "1.0".to_string())].into_iter().collect(),
+                ..Default::default()
             },
             Block {
                 id: "res-bb".into(),
                 kind: "mtk/resistor".into(),
                 x: 1.0,
-                y: 0.0,
                 params: [("R".to_string(), "1.0".to_string())].into_iter().collect(),
+                ..Default::default()
             },
             Block {
                 id: "cap-cc".into(),
                 kind: "mtk/capacitor".into(),
                 x: 2.0,
-                y: 0.0,
                 params: [("C".to_string(), "1.0".to_string())].into_iter().collect(),
+                ..Default::default()
             },
             Block {
                 id: "gnd-dd".into(),
                 kind: "mtk/ground".into(),
                 x: 3.0,
-                y: 0.0,
-                params: Default::default(),
+                ..Default::default()
             },
         ];
         f.wires = vec![
@@ -436,32 +435,31 @@ mod tests {
             id: "wall".into(),
             kind: "mtk/fixed".into(),
             x: 4.0,
-            y: 0.0,
-            params: Default::default(),
+            ..Default::default()
         });
         mixed.blocks.push(Block {
             id: "spr".into(),
             kind: "mtk/spring".into(),
             x: 5.0,
-            y: 0.0,
             params: [
                 ("k".to_string(), "100.0".to_string()),
                 ("s0".to_string(), "0.1".to_string()),
             ]
             .into_iter()
             .collect(),
+            ..Default::default()
         });
         mixed.blocks.push(Block {
             id: "ms".into(),
             kind: "mtk/mass".into(),
             x: 6.0,
-            y: 0.0,
             params: [
                 ("m".to_string(), "1.0".to_string()),
                 ("s0".to_string(), "0.1".to_string()),
             ]
             .into_iter()
             .collect(),
+            ..Default::default()
         });
         mixed.wires.push(Wire {
             id: "w5".into(),

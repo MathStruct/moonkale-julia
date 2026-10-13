@@ -1,6 +1,6 @@
 [package]
 name = "moonkale-ext-lux"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 description = "A Lux.jl block library for Moonkale's flow editor, with Julia codegen. An opt-in Moonkale extension (Milestone 6); its own repository since Milestone 18 phase 6.4."
