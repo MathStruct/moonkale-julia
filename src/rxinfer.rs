@@ -70,7 +70,30 @@ fn factor(
     }
 }
 
+/// The line under each factor (Moonkale ADR-0024 §6): the factor as it
+/// is written, `θ ~ Beta(2.0, 7.0)` — a wired channel shows its
+/// variable's name, an unwired one its constant.
+fn caption(id: &str) -> Option<&'static str> {
+    Some(match id {
+        "beta" => "{out} ~ Beta({a}, {b})",
+        "bernoulli" => "{out} ~ Bernoulli({p})",
+        "normal" => "{out} ~ Normal({mean}, {variance})",
+        "normal_precision" => "{out} ~ NormalMP({mean}, {precision})",
+        "gamma" => "{out} ~ Gamma({shape}, {rate})",
+        "poisson" => "{out} ~ Poisson({rate})",
+        _ => return None,
+    })
+}
+
 pub fn library() -> FlowLibrary {
+    let mut lib = kinds();
+    for k in lib.blocks.iter_mut() {
+        k.caption = caption(&k.id).map(String::from);
+    }
+    lib
+}
+
+fn kinds() -> FlowLibrary {
     FlowLibrary {
         id: "rxinfer",
         name: "RxInfer",
@@ -147,5 +170,33 @@ pub fn library() -> FlowLibrary {
                 "M 10 26 V 17 M 16 26 V 10 M 22 26 V 12 M 28 26 V 19 M 34 26 V 23",
             ),
         ],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_factor_captions_itself_with_its_own_channels() {
+        for k in library().blocks {
+            if k.role != Some(Role::Factor) {
+                assert!(k.caption.is_none(), "{}", k.id);
+                continue;
+            }
+            let c = k
+                .caption
+                .as_ref()
+                .unwrap_or_else(|| panic!("{} has no caption", k.id));
+            assert!(c.starts_with("{out} ~ "), "{c}");
+            for hole in c.split('{').skip(1) {
+                let name = hole.split('}').next().unwrap();
+                assert!(
+                    k.connections.iter().any(|p| p.name == name),
+                    "{}: {{{name}}}",
+                    k.id
+                );
+            }
+        }
     }
 }
