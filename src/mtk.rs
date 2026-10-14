@@ -87,7 +87,30 @@ fn acausal(
     }
 }
 
+/// The value line under each part (Moonkale ADR-0024 §6): its main
+/// parameter with its unit. Ground and Fixed have none.
+fn caption(id: &str) -> Option<&'static str> {
+    Some(match id {
+        "resistor" => "{R} Ω",
+        "capacitor" => "{C} F",
+        "inductor" => "{L} H",
+        "voltage" => "{V} V",
+        "mass" => "{m} kg",
+        "spring" => "{k} N/m",
+        "damper" => "{d} N·s/m",
+        _ => return None,
+    })
+}
+
 pub fn library() -> FlowLibrary {
+    let mut lib = parts();
+    for k in lib.blocks.iter_mut() {
+        k.caption = caption(&k.id).map(String::from);
+    }
+    lib
+}
+
+fn parts() -> FlowLibrary {
     FlowLibrary {
         id: "mtk",
         name: "ModelingToolkit",
@@ -135,9 +158,9 @@ pub fn library() -> FlowLibrary {
                 "A constant voltage source: V in V.",
                 vec![pin("p", "electrical"), pin("n", "electrical")],
                 vec![p("V", "1.0")],
-                // A circle, + on the p side.
+                // A circle, + on the p side (no −: a turned minus reads as a bar).
                 two_terminal(
-                    "M 0 16 H 28 M 52 16 H 80 M 52 16 A 12 12 0 1 1 28 16 A 12 12 0 1 1 52 16 M 31 16 H 37 M 34 13 V 19 M 43 16 H 49",
+                    "M 0 16 H 28 M 52 16 H 80 M 52 16 A 12 12 0 1 1 28 16 A 12 12 0 1 1 52 16 M 31 16 H 38 M 34.5 12.5 V 19.5",
                     "p",
                     "n",
                 ),
@@ -226,6 +249,17 @@ mod tests {
     #[test]
     fn every_component_draws_a_symbol_that_anchors_all_its_pins() {
         for k in library().blocks {
+            // A caption names only the kind's own parameters.
+            if let Some(c) = &k.caption {
+                for hole in c.split('{').skip(1) {
+                    let name = hole.split('}').next().unwrap();
+                    assert!(
+                        k.params.iter().any(|p| p.name == name),
+                        "{}: {{{name}}}",
+                        k.id
+                    );
+                }
+            }
             let s = k
                 .symbol
                 .as_ref()
