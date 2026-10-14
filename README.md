@@ -26,6 +26,6 @@ then switch it on in **Settings → Extensions → Lux.jl library**; the flow ed
 
 ## Developing it
 
-It depends on Moonkale's extension contract by **git tag** (`ext-api-YYYY-MM-DD`, today `ext-api-2026-10-14`; see Moonkale's `packages/ext-api/CHANGELOG.md`), so `cargo test` here builds against that tag. To work on both at once, point Moonkale's distribution at a local checkout (`[patch."https://github.com/MathStruct/moonkale-julia"]` in Moonkale's `Cargo.toml`).
+It depends on Moonkale's extension contract by **git tag** (`ext-api-YYYY-MM-DD`, today `ext-api-2026-10-14-2`; see Moonkale's `packages/ext-api/CHANGELOG.md`), so `cargo test` here builds against that tag. To work on both at once, point Moonkale's distribution at a local checkout (`[patch."https://github.com/MathStruct/moonkale-julia"]` in Moonkale's `Cargo.toml`).
 
 Notes on the code: `lux.md`. License: MIT.
