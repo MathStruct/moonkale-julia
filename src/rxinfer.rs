@@ -11,7 +11,9 @@
 //! i.i.d. data vector); the generated model takes the observed variables
 //! as its data arguments.
 
-use moonkale_ext_api::flow::{BlockKind, FlowLibrary, Param, ParamKind, Port, PortType, Role};
+use moonkale_ext_api::flow::{
+    BlockKind, FlowLibrary, Param, ParamKind, Port, PortType, Role, Symbol,
+};
 
 /// A channel or a variable's pin. `out` must be wired; a parameter channel
 /// falls back to its constant.
@@ -31,9 +33,28 @@ fn float(name: &str, default: &str) -> Param {
     }
 }
 
+/// A factor's drawing (Moonkale ADR-0024): a framed plot of its density
+/// or mass function over a baseline, 44 × 32. The pins keep the editor's
+/// default for factors — the generated variable `out` on the right, the
+/// parameters in from the left.
+fn plot(glyph: &str) -> Symbol {
+    Symbol {
+        width: 44.0,
+        height: 32.0,
+        path: format!("M 0 0 H 44 V 32 H 0 Z M 6 26 H 38 {glyph}"),
+        anchors: vec![],
+    }
+}
+
 /// A distribution factor: `out` plus one channel per parameter, each
 /// channel's constant a parameter of the same name.
-fn factor(id: &str, name: &str, description: &str, params: &[(&str, &str)]) -> BlockKind {
+fn factor(
+    id: &str,
+    name: &str,
+    description: &str,
+    params: &[(&str, &str)],
+    glyph: &str,
+) -> BlockKind {
     let mut connections = vec![pin("out", true)];
     connections.extend(params.iter().map(|(n, _)| pin(n, false)));
     BlockKind {
@@ -44,6 +65,7 @@ fn factor(id: &str, name: &str, description: &str, params: &[(&str, &str)]) -> B
         connections,
         params: params.iter().map(|(n, d)| float(n, d)).collect(),
         role: Some(Role::Factor),
+        symbol: Some(plot(glyph)),
         ..Default::default()
     }
 }
@@ -81,36 +103,48 @@ pub fn library() -> FlowLibrary {
                 "Beta",
                 "Beta(a, b): a prior on a probability.",
                 &[("a", "1.0"), ("b", "1.0")],
+                // A hump on [0, 1].
+                "M 8 26 C 12 4, 24 4, 36 26",
             ),
             factor(
                 "bernoulli",
                 "Bernoulli",
                 "Bernoulli(p): a coin flip, 1 with probability p.",
                 &[("p", "0.5")],
+                // Two bars: 0 and 1.
+                "M 15 26 V 16 M 29 26 V 9",
             ),
             factor(
                 "normal",
                 "Normal",
                 "Normal(mean, variance).",
                 &[("mean", "0.0"), ("variance", "1.0")],
+                // The bell.
+                "M 6 26 C 15 26, 16 6, 22 6 C 28 6, 29 26, 38 26",
             ),
             factor(
                 "normal_precision",
                 "Normal (precision)",
                 "Normal(mean, precision): the form a Gamma precision prior conjugates with.",
                 &[("mean", "0.0"), ("precision", "1.0")],
+                // The bell, narrow: a precision.
+                "M 6 26 C 17 26, 18 5, 22 5 C 26 5, 27 26, 38 26",
             ),
             factor(
                 "gamma",
                 "Gamma",
                 "Gamma(shape, rate): a prior on a positive quantity (a rate, a precision).",
                 &[("shape", "1.0"), ("rate", "1.0")],
+                // Skewed right, a long tail.
+                "M 6 26 C 9 6, 15 6, 21 16 C 26 23, 31 25, 38 25",
             ),
             factor(
                 "poisson",
                 "Poisson",
                 "Poisson(rate): a count.",
                 &[("rate", "1.0")],
+                // Counts: bars that rise and fall.
+                "M 10 26 V 17 M 16 26 V 10 M 22 26 V 12 M 28 26 V 19 M 34 26 V 23",
             ),
         ],
     }
