@@ -10,6 +10,7 @@
 //! Optimiser there is an error, not a layer.
 
 use moonkale_ext_api::flow::{Block, Flow, FlowLibrary, Generated, Subflow};
+use std::collections::BTreeSet;
 
 /// The boundary pseudo-block id prefix (ADR-0021 §3), as in
 /// `mtk_codegen.rs` — ext-api's own `flow::BOUNDARY` is still above
@@ -24,8 +25,34 @@ fn param<'a>(b: &'a Block, name: &str, default: &'a str) -> &'a str {
 fn num(b: &Block, name: &str, default: &str) -> Result<String, String> {
     let v = param(b, name, default).trim();
     v.parse::<f64>()
+        .ok()
+        .filter(|f| f.is_finite())
         .map(|_| v.to_string())
-        .map_err(|_| format!("{}.{name} = {v:?} is not a number", b.id))
+        .ok_or_else(|| format!("{}.{name} = {v:?} is not a number", b.id))
+}
+
+/// A Julia identifier, optionally dotted (`relu`, `Lux.relu`, `Adam`).
+fn is_julia_ident(s: &str) -> bool {
+    !s.is_empty()
+        && s.split('.').all(|seg| {
+            let mut chars = seg.chars();
+            chars
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+}
+
+fn ident(b: &Block, name: &str, default: &str) -> Result<String, String> {
+    let v = param(b, name, default);
+    if is_julia_ident(v) {
+        Ok(v.to_string())
+    } else {
+        Err(format!(
+            "{}.{name} = {v:?} is not a valid Julia identifier",
+            b.id
+        ))
+    }
 }
 
 /// The chain's running shape: the input features or channels the next
@@ -49,7 +76,7 @@ fn emit_layer(
     match kind {
         "dense" => {
             let out = num(b, "out", "128")?;
-            let act = param(b, "activation", "relu");
+            let act = ident(b, "activation", "relu")?;
             let inp = st.in_features.clone().ok_or_else(|| {
                 format!(
                     "{}: input size unknown — put a Flatten before a Dense after image layers",
@@ -63,7 +90,7 @@ fn emit_layer(
             let ch = num(b, "channels", "16")?;
             let k = num(b, "kernel", "3")?;
             let pad = num(b, "pad", "1")?;
-            let act = param(b, "activation", "relu");
+            let act = ident(b, "activation", "relu")?;
             let inp = st
                 .in_channels
                 .clone()
@@ -202,14 +229,23 @@ pub fn generate(flow: &Flow, lib: &FlowLibrary) -> Result<Generated, String> {
         .find(|b| kind(b) == "input")
         .ok_or("the flow needs an Input block")?;
     // Follow the single output wire from block to block.
-    let next = |from: &Block| -> Option<&Block> {
-        flow.wires
-            .iter()
-            .find(|w| w.from_block == from.id)
-            .and_then(|w| flow.block(&w.to_block))
+    let next = |from: &Block| -> Result<Option<&Block>, String> {
+        let mut outgoing = flow.wires.iter().filter(|w| w.from_block == from.id);
+        let Some(first) = outgoing.next() else {
+            return Ok(None);
+        };
+        if outgoing.next().is_some() {
+            return Err(format!(
+                "{}: has more than one outgoing wire (fan-out is not supported)",
+                from.id
+            ));
+        }
+        Ok(flow.block(&first.to_block))
     };
+    let mut used: BTreeSet<&str> = BTreeSet::new();
+    used.insert(input.id.as_str());
     let mut layers: Vec<String> = Vec::new();
-    let mut cur = next(input);
+    let mut cur = next(input)?;
     let mut loss: Option<&Block> = None;
     let mut optimiser: Option<&Block> = None;
     let mut st = ChainState {
@@ -222,6 +258,7 @@ pub fn generate(flow: &Flow, lib: &FlowLibrary) -> Result<Generated, String> {
         if guard > 256 {
             return Err("chain too long (cycle?)".into());
         }
+        used.insert(b.id.as_str());
         // A subflow block is a sub-Chain: its inner path splices in
         // between the boundary input and output (ADR-0021 §6).
         if let Some(sub_id) = &b.subflow {
@@ -232,25 +269,39 @@ pub fn generate(flow: &Flow, lib: &FlowLibrary) -> Result<Generated, String> {
                 )
             })?;
             splice_subflow(flow, sub, &prefix, &mut st, &mut layers, 0)?;
-            cur = next(b);
+            cur = next(b)?;
             continue;
         }
         if kind(b) == "loss" {
             loss = Some(b);
-            cur = next(b);
+            cur = next(b)?;
             if let Some(o) = cur {
                 if kind(o) == "optimiser" {
+                    used.insert(o.id.as_str());
                     optimiser = Some(o);
+                    let _ = next(o)?;
                 }
             }
             break;
         }
         emit_layer(b, &prefix, &mut st, &mut layers)?;
-        cur = next(b);
+        cur = next(b)?;
     }
     let loss = loss.ok_or("the chain must end in a Loss block")?;
     if layers.is_empty() {
         return Err("the flow has no layers between Input and Loss".into());
+    }
+    let unused: Vec<&str> = flow
+        .blocks
+        .iter()
+        .filter(|b| !used.contains(b.id.as_str()))
+        .map(|b| b.id.as_str())
+        .collect();
+    if !unused.is_empty() {
+        return Err(format!(
+            "unused block(s) not on the Input → Loss path: {}",
+            unused.join(", ")
+        ));
     }
     // `Lux.NoInputSize` is a placeholder for "use a lazy Dense": Lux needs the
     // size, so we compute it by running the front of the chain once.
@@ -267,11 +318,11 @@ pub fn generate(flow: &Flow, lib: &FlowLibrary) -> Result<Generated, String> {
         .collect::<Vec<_>>()
         .join(", ");
     let batch = num(input, "batch", "32")?;
-    let loss_kind = param(loss, "kind", "CrossEntropyLoss");
+    let loss_kind = ident(loss, "kind", "CrossEntropyLoss")?;
     let classes = num(loss, "classes", "10")?;
     let (rule, lr, epochs) = match optimiser {
         Some(o) => (
-            param(o, "rule", "Adam").to_string(),
+            ident(o, "rule", "Adam")?,
             num(o, "lr", "0.001")?,
             num(o, "epochs", "5")?,
         ),
@@ -404,6 +455,100 @@ mod tests {
         f.blocks[1].params.insert("out".into(), "many".into());
         f.blocks[0].params.insert("shape".into(), "784".into());
         assert!(generate(&f, &lib).unwrap_err().contains("not a number"));
+    }
+
+    #[test]
+    fn unwired_extra_layer_is_refused() {
+        let lib = crate::library();
+        let mut f = super::tests_support::cnn_flow();
+        f.blocks.push(b("orphan", "dense", &[]));
+        let err = generate(&f, &lib).unwrap_err();
+        assert!(err.contains("orphan"), "{err}");
+    }
+
+    #[test]
+    fn side_branch_is_refused() {
+        let lib = crate::library();
+        let mut f = super::tests_support::cnn_flow();
+        f.blocks.push(b("side", "dropout", &[]));
+        f.wires.push(w("side", "out", "d1", "in"));
+        let err = generate(&f, &lib).unwrap_err();
+        assert!(err.contains("side"), "{err}");
+    }
+
+    #[test]
+    fn fan_out_is_refused() {
+        let lib = crate::library();
+        let mut f = super::tests_support::cnn_flow();
+        f.blocks.push(b("branch", "dense", &[("out", "10")]));
+        f.wires.push(w("fl", "out", "branch", "in"));
+        let err = generate(&f, &lib).unwrap_err();
+        assert!(err.contains("fl"), "{err}");
+    }
+
+    #[test]
+    fn bad_activation_and_names_are_refused() {
+        let lib = crate::library();
+        let mut f = Flow::new();
+        f.blocks = vec![
+            b("in", "input", &[("shape", "784")]),
+            b("d", "dense", &[("activation", "relu); run(`rm -rf /`); (")]),
+            b("l", "loss", &[]),
+            b("o", "optimiser", &[]),
+        ];
+        f.wires = vec![
+            w("in", "out", "d", "in"),
+            w("d", "out", "l", "prediction"),
+            w("l", "loss", "o", "loss"),
+        ];
+        let err = generate(&f, &lib).unwrap_err();
+        assert!(err.contains("d.activation"), "{err}");
+
+        f.blocks[1]
+            .params
+            .insert("activation".into(), "relu".into());
+        f.blocks[2]
+            .params
+            .insert("kind".into(), "CrossEntropyLoss); bad(".into());
+        let err = generate(&f, &lib).unwrap_err();
+        assert!(err.contains("l.kind"), "{err}");
+
+        f.blocks[2]
+            .params
+            .insert("kind".into(), "CrossEntropyLoss".into());
+        f.blocks[3].params.insert("rule".into(), "1Adam".into());
+        let err = generate(&f, &lib).unwrap_err();
+        assert!(err.contains("o.rule"), "{err}");
+    }
+
+    #[test]
+    fn dotted_activation_is_accepted() {
+        let lib = crate::library();
+        let mut f = Flow::new();
+        f.blocks = vec![
+            b("in", "input", &[("shape", "784")]),
+            b("d", "dense", &[("out", "10"), ("activation", "Lux.relu")]),
+            b("l", "loss", &[]),
+        ];
+        f.wires = vec![w("in", "out", "d", "in"), w("d", "out", "l", "prediction")];
+        let g = generate(&f, &lib).expect("dotted activation should succeed");
+        assert!(g.text.contains("Dense(784 => 10, Lux.relu)"), "{}", g.text);
+    }
+
+    #[test]
+    fn non_finite_sizes_are_refused() {
+        let lib = crate::library();
+        for bad_val in ["NaN", "inf", "infinity", "-inf"] {
+            let mut f = Flow::new();
+            f.blocks = vec![
+                b("in", "input", &[("shape", "784")]),
+                b("d", "dense", &[("out", bad_val)]),
+                b("l", "loss", &[]),
+            ];
+            f.wires = vec![w("in", "out", "d", "in"), w("d", "out", "l", "prediction")];
+            let err = generate(&f, &lib).unwrap_err();
+            assert!(err.contains("is not a number"), "{bad_val}: {err}");
+        }
     }
     // ---- ADR-0021 stage C: the sub-Chain splice -------------------
 
