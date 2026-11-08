@@ -29,11 +29,13 @@ fn param<'a>(b: &'a Block, name: &str, default: &'a str) -> &'a str {
 /// (`2` → `2.0`), so a constant never turns a distribution integer.
 fn float_lit(v: &str) -> Option<String> {
     let v = v.trim();
-    let f = v.parse::<f64>().ok().filter(|f| f.is_finite())?;
+    v.parse::<f64>().ok().filter(|f| f.is_finite())?;
+    // Keep the digits as typed: going through f64 would round integers
+    // beyond 2^53 (J-BUG-03, Gemini's review 2026-11-07).
     Some(if v.contains(['.', 'e', 'E']) {
         v.to_string()
     } else {
-        format!("{f:.1}")
+        format!("{v}.0")
     })
 }
 
@@ -655,5 +657,18 @@ mod tests {
                 .any(|i| i.about == "w9" && i.message.contains("not to factors")),
             "{issues:?}"
         );
+    }
+    #[test]
+    fn float_literals_keep_their_digits() {
+        assert_eq!(float_lit("2").as_deref(), Some("2.0"));
+        assert_eq!(float_lit(" 3 ").as_deref(), Some("3.0"));
+        assert_eq!(float_lit("1e-3").as_deref(), Some("1e-3"));
+        assert_eq!(
+            float_lit("12345678901234567890").as_deref(),
+            Some("12345678901234567890.0")
+        );
+        assert_eq!(float_lit("NaN"), None);
+        assert_eq!(float_lit("inf"), None);
+        assert_eq!(float_lit("x"), None);
     }
 }
