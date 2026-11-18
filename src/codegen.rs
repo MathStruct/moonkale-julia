@@ -557,6 +557,7 @@ mod tests {
         let mut f = Flow::new();
         f.subflows = vec![Subflow {
             id: "encoder".into(),
+            role: None,
             name: "Encoder".into(),
             // One path in, one path out — a chain has no branches.
             inputs: vec![Port {
@@ -672,6 +673,7 @@ mod tests {
         let mut f = Flow::new();
         f.subflows = vec![Subflow {
             id: "two_ins".into(),
+            role: None,
             name: "Two inputs".into(),
             inputs: vec![
                 Port {
