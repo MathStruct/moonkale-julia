@@ -220,7 +220,25 @@ fn splice_subflow(
     }
 }
 
+/// Plates (Moonkale ADR-0032) are not generated for this library yet: a
+/// plated block is refused by name, never silently unrolled once.
+pub(crate) fn refuse_plates(flow: &Flow, library: &str) -> Result<(), String> {
+    let plated = flow
+        .blocks
+        .iter()
+        .chain(flow.subflows.iter().flat_map(|s| s.blocks.iter()))
+        .find(|b| b.plate.is_some());
+    match plated {
+        Some(b) => Err(format!(
+            "{} is in a plate — {library} code is not generated for plates yet",
+            b.id
+        )),
+        None => Ok(()),
+    }
+}
+
 pub fn generate(flow: &Flow, lib: &FlowLibrary) -> Result<Generated, String> {
+    refuse_plates(flow, "Lux")?;
     let prefix = format!("{}/", lib.id);
     let kind = |b: &Block| b.kind.strip_prefix(&prefix).unwrap_or(&b.kind).to_string();
     let order = flow.topological()?;
@@ -614,6 +632,7 @@ mod tests {
                     to_port: "y".into(),
                 },
             ],
+            plates: vec![],
         }];
         // Input → the subsystem → Loss: the inner Conv and Flatten
         // splice in where the subsystem sits.
@@ -691,6 +710,7 @@ mod tests {
             connections: vec![],
             blocks: vec![],
             wires: vec![],
+            plates: vec![],
         }];
         f.blocks = vec![
             Block {
@@ -817,5 +837,13 @@ pub(crate) mod tests_support {
             w("l", "loss", "o", "loss"),
         ];
         f
+    }
+
+    #[test]
+    fn a_plated_block_is_refused_not_unrolled() {
+        let mut f = cnn_flow();
+        f.blocks[0].plate = Some("p".into());
+        let err = super::generate(&f, &crate::library()).unwrap_err();
+        assert!(err.contains("not generated for plates"), "{err}");
     }
 }
