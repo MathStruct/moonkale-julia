@@ -12,16 +12,30 @@
 //! as its data arguments.
 
 use moonkale_ext_api::flow::{
-    BlockKind, FlowLibrary, Param, ParamKind, Port, PortType, Role, Symbol,
+    BlockKind, FlowLibrary, Param, ParamKind, Port, PortType, Role, Space, Symbol,
 };
 
 /// A channel or a variable's pin. `out` must be wired; a parameter channel
 /// falls back to its constant.
 fn pin(name: &str, required: bool) -> Port {
+    typed(name, required, PortType::Any)
+}
+
+fn typed(name: &str, required: bool, ty: PortType) -> Port {
     Port {
         name: name.into(),
-        ty: PortType::Any,
+        ty,
         required,
+    }
+}
+
+/// A channel's type (Moonkale ADR-0032 §3): its space, and a unit where
+/// the distribution relates its channels' units (`'u` is bound per block:
+/// Normal's mean and draw share it, its variance is its square).
+fn ch(space: Space, unit: Option<&str>) -> PortType {
+    PortType::Value {
+        space,
+        unit: unit.map(String::from),
     }
 }
 
@@ -52,18 +66,19 @@ fn factor(
     id: &str,
     name: &str,
     description: &str,
-    params: &[(&str, &str)],
+    out: PortType,
+    params: &[(&str, &str, PortType)],
     glyph: &str,
 ) -> BlockKind {
-    let mut connections = vec![pin("out", true)];
-    connections.extend(params.iter().map(|(n, _)| pin(n, false)));
+    let mut connections = vec![typed("out", true, out)];
+    connections.extend(params.iter().map(|(n, _, t)| typed(n, false, t.clone())));
     BlockKind {
         id: id.into(),
         name: name.into(),
         category: "factors".into(),
         description: description.into(),
         connections,
-        params: params.iter().map(|(n, d)| float(n, d)).collect(),
+        params: params.iter().map(|(n, d, _)| float(n, d)).collect(),
         role: Some(Role::Factor),
         symbol: Some(plot(glyph)),
         ..Default::default()
@@ -104,7 +119,7 @@ fn kinds() -> FlowLibrary {
                 id: "variable".into(),
                 name: "Variable".into(),
                 category: "variables".into(),
-                description: "A random variable: name it; give it data to observe it (one number, or several for an i.i.d. vector).".into(),
+                description: "A random variable: name it; give it data to observe it (one number, or several for an i.i.d. vector); its space and unit are checked against every factor it joins.".into(),
                 connections: vec![pin("x", true)],
                 params: vec![
                     Param {
@@ -117,6 +132,18 @@ fn kinds() -> FlowLibrary {
                         kind: ParamKind::Text,
                         default: String::new(),
                     },
+                    // Moonkale ADR-0032 §4: refine the pin; empty = as the
+                    // factors say.
+                    Param {
+                        name: "space".into(),
+                        kind: ParamKind::Space { pin: "x".into() },
+                        default: String::new(),
+                    },
+                    Param {
+                        name: "unit".into(),
+                        kind: ParamKind::Unit { pin: "x".into() },
+                        default: String::new(),
+                    },
                 ],
                 role: Some(Role::Variable),
                 ..Default::default()
@@ -125,7 +152,11 @@ fn kinds() -> FlowLibrary {
                 "beta",
                 "Beta",
                 "Beta(a, b): a prior on a probability.",
-                &[("a", "1.0"), ("b", "1.0")],
+                ch(Space::UnitInterval, None),
+                &[
+                    ("a", "1.0", ch(Space::Positive, Some("1"))),
+                    ("b", "1.0", ch(Space::Positive, Some("1"))),
+                ],
                 // A hump on [0, 1].
                 "M 8 26 C 12 4, 24 4, 36 26",
             ),
@@ -133,7 +164,8 @@ fn kinds() -> FlowLibrary {
                 "bernoulli",
                 "Bernoulli",
                 "Bernoulli(p): a coin flip, 1 with probability p.",
-                &[("p", "0.5")],
+                ch(Space::Binary, None),
+                &[("p", "0.5", ch(Space::UnitInterval, None))],
                 // Two bars: 0 and 1.
                 "M 15 26 V 16 M 29 26 V 9",
             ),
@@ -141,7 +173,11 @@ fn kinds() -> FlowLibrary {
                 "normal",
                 "Normal",
                 "Normal(mean, variance).",
-                &[("mean", "0.0"), ("variance", "1.0")],
+                ch(Space::Real, Some("'u")),
+                &[
+                    ("mean", "0.0", ch(Space::Real, Some("'u"))),
+                    ("variance", "1.0", ch(Space::Positive, Some("'u^2"))),
+                ],
                 // The bell.
                 "M 6 26 C 15 26, 16 6, 22 6 C 28 6, 29 26, 38 26",
             ),
@@ -149,7 +185,11 @@ fn kinds() -> FlowLibrary {
                 "normal_precision",
                 "Normal (precision)",
                 "Normal(mean, precision): the form a Gamma precision prior conjugates with.",
-                &[("mean", "0.0"), ("precision", "1.0")],
+                ch(Space::Real, Some("'u")),
+                &[
+                    ("mean", "0.0", ch(Space::Real, Some("'u"))),
+                    ("precision", "1.0", ch(Space::Positive, Some("'u^-2"))),
+                ],
                 // The bell, narrow: a precision.
                 "M 6 26 C 17 26, 18 5, 22 5 C 26 5, 27 26, 38 26",
             ),
@@ -157,7 +197,11 @@ fn kinds() -> FlowLibrary {
                 "gamma",
                 "Gamma",
                 "Gamma(shape, rate): a prior on a positive quantity (a rate, a precision).",
-                &[("shape", "1.0"), ("rate", "1.0")],
+                ch(Space::Positive, Some("'u")),
+                &[
+                    ("shape", "1.0", ch(Space::Positive, Some("1"))),
+                    ("rate", "1.0", ch(Space::Positive, Some("'u^-1"))),
+                ],
                 // Skewed right, a long tail.
                 "M 6 26 C 9 6, 15 6, 21 16 C 26 23, 31 25, 38 25",
             ),
@@ -165,7 +209,8 @@ fn kinds() -> FlowLibrary {
                 "poisson",
                 "Poisson",
                 "Poisson(rate): a count.",
-                &[("rate", "1.0")],
+                ch(Space::Count, None),
+                &[("rate", "1.0", ch(Space::Positive, None))],
                 // Counts: bars that rise and fall.
                 "M 10 26 V 17 M 16 26 V 10 M 22 26 V 12 M 28 26 V 19 M 34 26 V 23",
             ),

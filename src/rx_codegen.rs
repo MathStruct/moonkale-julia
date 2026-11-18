@@ -15,10 +15,17 @@
 //!   `MeanField()`, an initial marginal per latent variable, 30
 //!   iterations, the last posterior printed.
 //!
+//! - A plate (Moonkale ADR-0032) is a loop: its variables are indexed
+//!   (`z[i]`), its factors run `for i in eachindex(y)` (sized by its
+//!   observed data) or `for i in 1:N` (its stated size). Nested plates
+//!   are not generated yet.
+//!
 //! Anything this cannot generate is an error naming the block, never a
 //! silently wrong file.
 
-use moonkale_ext_api::flow::{Block, Flow, FlowLibrary, Generated, Role, Wire, BOUNDARY};
+use moonkale_ext_api::flow::{
+    plates_of, Block, Flow, FlowLibrary, Generated, Plate, Role, Wire, BOUNDARY,
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 fn param<'a>(b: &'a Block, name: &str, default: &'a str) -> &'a str {
@@ -45,6 +52,8 @@ fn is_ident(s: &str) -> bool {
     let mut c = s.chars();
     c.next().is_some_and(|f| f.is_alphabetic() || f == '_')
         && c.all(|ch| ch.is_alphanumeric() || ch == '_')
+        // All underscores is write-only in Julia: `y[_]` cannot read it.
+        && !s.chars().all(|ch| ch == '_')
         && !matches!(
             s,
             // Julia's reserved words, and the generated file's own names.
@@ -149,19 +158,26 @@ fn dist(kind: &str) -> Option<Dist> {
     })
 }
 
+/// A block's plates after flattening, innermost first: `(flat id, plate)`.
+type Chain<'a> = Vec<(String, &'a Plate)>;
+
 /// A variable as the generator sees it.
 struct Var {
     name: String,
     /// The data, already Julia literals; empty = latent.
     data: Vec<String>,
+    /// Its plate's flat id (one level: nested plates are refused).
+    plate: Option<String>,
 }
 
 impl Var {
     fn observed(&self) -> bool {
         !self.data.is_empty()
     }
+    /// A vector in Julia: in a plate, or several data values (the
+    /// implicit i.i.d. vector of an unplated variable).
     fn vector(&self) -> bool {
-        self.data.len() > 1
+        self.plate.is_some() || self.data.len() > 1
     }
 }
 
@@ -181,8 +197,8 @@ enum End {
 /// subsystem pins seen from each side.
 #[derive(Default)]
 struct Flat<'a> {
-    /// `(flat id, block, name prefix)` of every variable and factor.
-    blocks: Vec<(String, &'a Block, String)>,
+    /// `(flat id, block, name prefix, plates)` of every variable and factor.
+    blocks: Vec<(String, &'a Block, String, Chain<'a>)>,
     /// Every scope's wires as flat ends.
     wires: Vec<(End, End)>,
     /// Instance flat id → its subsystem's declared pins.
@@ -214,6 +230,8 @@ fn expand<'a>(
     flow: &'a Flow,
     blocks: &'a [Block],
     wires: &'a [Wire],
+    plates: &'a [Plate],
+    outer: &Chain<'a>,
     host: &str,
     id_prefix: &str,
     name_prefix: &str,
@@ -234,6 +252,12 @@ fn expand<'a>(
     let mut pins_of: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for b in blocks {
         let flat = format!("{id_prefix}{}", b.id);
+        // Its own plates (flat ids carry the instance), then the host's.
+        let mut chain: Chain<'a> = plates_of(plates, b)
+            .into_iter()
+            .map(|p| (format!("{id_prefix}{}", p.id), p))
+            .collect();
+        chain.extend(outer.iter().cloned());
         if let Some(sub_id) = &b.subflow {
             let sub = flow.subflow(sub_id).ok_or_else(|| {
                 format!(
@@ -266,6 +290,8 @@ fn expand<'a>(
                 flow,
                 &sub.blocks,
                 &sub.wires,
+                &sub.plates,
+                &chain,
                 &flat,
                 &format!("{flat}/"),
                 &format!("{name_prefix}{instance}_"),
@@ -295,7 +321,7 @@ fn expand<'a>(
                     End::Channel(flat.clone(), String::new())
                 },
             );
-            out.blocks.push((flat, b, name_prefix.to_string()));
+            out.blocks.push((flat, b, name_prefix.to_string(), chain));
         }
     }
     let end = |id: &str, port: &str| -> Result<(End, bool), String> {
@@ -385,6 +411,8 @@ pub fn generate(flow: &Flow, lib: &FlowLibrary) -> Result<Generated, String> {
         flow,
         &flow.blocks,
         &flow.wires,
+        &flow.plates,
+        &Vec::new(),
         "",
         "",
         "",
@@ -411,9 +439,25 @@ pub fn generate(flow: &Flow, lib: &FlowLibrary) -> Result<Generated, String> {
     // The variables: named, unique, their data parsed.
     let mut vars: BTreeMap<String, Var> = BTreeMap::new();
     let mut taken: BTreeSet<String> = BTreeSet::new();
-    let mut factors: Vec<(&str, &Block, Dist)> = Vec::new();
-    for (id, b, name_prefix) in &flat.blocks {
+    let mut factors: Vec<(&str, &Block, Dist, Option<String>)> = Vec::new();
+    // Flat plate id → (its plate, the variables and factors in it).
+    let mut plates: BTreeMap<String, &Plate> = BTreeMap::new();
+    for (id, b, name_prefix, chain) in &flat.blocks {
         let k = kind_of(b).unwrap_or_default();
+        if chain.len() > 1 {
+            return Err(format!(
+                "{id} is in nested plates ({}) — nested plates are not generated yet",
+                chain
+                    .iter()
+                    .map(|(_, p)| p.index.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" × ")
+            ));
+        }
+        let plate = chain.first().map(|(fid, p)| {
+            plates.insert(fid.clone(), p);
+            fid.clone()
+        });
         if k == "variable" {
             let short = param(b, "name", "x").trim().to_string();
             if !is_ident(&short) {
@@ -430,9 +474,9 @@ pub fn generate(flow: &Flow, lib: &FlowLibrary) -> Result<Generated, String> {
                 .filter(|s| !s.is_empty())
                 .map(|s| float_lit(s).ok_or(format!("{name}: data value {s:?} is not a number")))
                 .collect::<Result<Vec<_>, _>>()?;
-            vars.insert(id.clone(), Var { name, data });
+            vars.insert(id.clone(), Var { name, data, plate });
         } else if let Some(d) = dist(&k) {
-            factors.push((id, b, d));
+            factors.push((id, b, d, plate));
         } else {
             return Err(format!("unknown kind {}", b.kind));
         }
@@ -512,6 +556,32 @@ pub fn generate(flow: &Flow, lib: &FlowLibrary) -> Result<Generated, String> {
         })
     };
 
+    // Each plate's index is a Julia name no variable takes.
+    for (fid, p) in &plates {
+        if !is_ident(&p.index) {
+            return Err(format!(
+                "plate {fid}: its index {:?} is not a Julia name",
+                p.index
+            ));
+        }
+        if let Some(v) = vars.values().find(|v| v.name == p.index) {
+            return Err(format!(
+                "plate {fid}: its index {} is also a variable's name",
+                v.name
+            ));
+        }
+        p.size().map_err(|e| e.to_string())?;
+    }
+    let index_of = |plate: &str| plates.get(plate).map(|p| p.index.as_str()).unwrap_or("i");
+    // A factor is in every plate of the variables it touches (ADR-0032 §2).
+    let outside = |v: &Var, fid: &str| {
+        format!(
+            "{} is one per {i}; {fid} is outside plate {i} and cannot take it — move the factor into the plate",
+            v.name,
+            i = v.plate.as_deref().map(index_of).unwrap_or("i")
+        )
+    };
+
     // Statements, and the dependencies between them.
     struct Stmt<'a> {
         out: &'a Var,
@@ -519,16 +589,27 @@ pub fn generate(flow: &Flow, lib: &FlowLibrary) -> Result<Generated, String> {
         inputs: Vec<&'a Var>,
         id: &'a str,
         dist: &'a Dist,
+        plate: Option<String>,
     }
     let mut stmts: Vec<Stmt> = Vec::new();
     let mut generated_by: BTreeMap<&str, &str> = BTreeMap::new();
     let mut counts: BTreeSet<&str> = BTreeSet::new();
-    for (fid, f, d) in &factors {
+    for (fid, f, d, fplate) in &factors {
         let fid: &str = fid;
         let out = wired(fid, "out")?.ok_or(format!(
             "the out channel of {} is not connected — wire it to the variable it generates",
             fid
         ))?;
+        if out.plate.is_some() && out.plate != *fplate {
+            return Err(outside(out, fid));
+        }
+        if let (Some(p), None) = (fplate, &out.plate) {
+            return Err(format!(
+                "{fid} is in plate {i} and draws one value per {i}, so {} must be in the plate too",
+                out.name,
+                i = index_of(p)
+            ));
+        }
         if let Some(other) = generated_by.insert(&out.name, fid) {
             return Err(format!(
                 "{} is generated by both {other} and {} — a variable has one generating factor",
@@ -540,14 +621,20 @@ pub fn generate(flow: &Flow, lib: &FlowLibrary) -> Result<Generated, String> {
         for ch in d.channels {
             let value = match wired(fid, ch)? {
                 Some(v) => {
-                    if v.vector() {
+                    if v.plate.is_some() && v.plate != *fplate {
+                        return Err(outside(v, fid));
+                    }
+                    if v.plate.is_none() && v.vector() {
                         return Err(format!(
                             "{}: the data vector {} can only be a factor's out (an i.i.d. likelihood)",
                             fid, v.name
                         ));
                     }
                     inputs.push(v);
-                    v.name.clone()
+                    match &v.plate {
+                        Some(p) => format!("{}[{}]", v.name, index_of(p)),
+                        None => v.name.clone(),
+                    }
                 }
                 None => {
                     // The block's constant, else its kind's default.
@@ -580,10 +667,10 @@ pub fn generate(flow: &Flow, lib: &FlowLibrary) -> Result<Generated, String> {
         if d.integer {
             counts.insert(&out.name);
         }
-        let target = if out.vector() {
-            format!("{}[i]", out.name)
-        } else {
-            out.name.clone()
+        let target = match &out.plate {
+            Some(p) => format!("{}[{}]", out.name, index_of(p)),
+            None if out.vector() => format!("{}[i]", out.name),
+            None => out.name.clone(),
         };
         stmts.push(Stmt {
             out,
@@ -591,6 +678,7 @@ pub fn generate(flow: &Flow, lib: &FlowLibrary) -> Result<Generated, String> {
             inputs,
             id: fid,
             dist: d,
+            plate: fplate.clone(),
         });
     }
 
@@ -606,11 +694,53 @@ pub fn generate(flow: &Flow, lib: &FlowLibrary) -> Result<Generated, String> {
     let observed: Vec<&Var> = flat
         .blocks
         .iter()
-        .filter_map(|(id, _, _)| vars.get(id))
+        .filter_map(|(id, _, _, _)| vars.get(id))
         .filter(|v| v.observed())
         .collect();
     if observed.is_empty() {
         return Err("nothing is observed — give a variable data".into());
+    }
+    // Each plate's loop: its stated size (the data must match it), or
+    // the length of its observed data (all of the same length).
+    let mut loops: BTreeMap<String, String> = BTreeMap::new();
+    for (fid, p) in &plates {
+        let i = &p.index;
+        let data: Vec<&&Var> = observed
+            .iter()
+            .filter(|v| v.plate.as_deref() == Some(fid.as_str()))
+            .collect();
+        let size = p.size().map_err(|e| e.to_string())?;
+        if let Some(n) = size {
+            if let Some(v) = data.iter().find(|v| v.data.len() as u64 != n) {
+                return Err(format!(
+                    "plate {i} has size {n}, but {} has {} values",
+                    v.name,
+                    v.data.len()
+                ));
+            }
+        } else if let Some(first) = data.first() {
+            if let Some(v) = data.iter().find(|v| v.data.len() != first.data.len()) {
+                return Err(format!(
+                    "plate {i}: {} has {} values but {} has {} — one plate, one length",
+                    first.name,
+                    first.data.len(),
+                    v.name,
+                    v.data.len()
+                ));
+            }
+        } else {
+            return Err(format!(
+                "plate {i} has no size and nothing observed in it — give it a size"
+            ));
+        }
+        loops.insert(
+            fid.clone(),
+            match (size, data.first()) {
+                (Some(n), _) => format!("for {i} in 1:{n}"),
+                (None, Some(v)) => format!("for {i} in eachindex({})", v.name),
+                (None, None) => unreachable!("refused above"),
+            },
+        );
     }
 
     // Order: a statement after those generating its inputs (Kahn, stable
@@ -656,14 +786,29 @@ pub fn generate(flow: &Flow, lib: &FlowLibrary) -> Result<Generated, String> {
         "@model function factor_graph({})\n",
         args.join(", ")
     ));
+    // Consecutive statements of one plate share its loop.
+    let mut open: Option<&str> = None;
     for s in &order {
-        if s.out.vector() {
+        if open.is_some() && open != s.plate.as_deref() {
+            text.push_str("    end\n");
+            open = None;
+        }
+        if let Some(p) = &s.plate {
+            if open.is_none() {
+                text.push_str(&format!("    {}\n", loops[p]));
+                open = Some(p);
+            }
+            text.push_str(&format!("        {}\n", s.line));
+        } else if s.out.vector() {
             text.push_str(&format!("    for i in eachindex({})\n", s.out.name));
             text.push_str(&format!("        {}\n", s.line));
             text.push_str("    end\n");
         } else {
             text.push_str(&format!("    {}\n", s.line));
         }
+    }
+    if open.is_some() {
+        text.push_str("    end\n");
     }
     text.push_str("end\n\n");
     if mean_field {
@@ -711,8 +856,10 @@ pub fn generate(flow: &Flow, lib: &FlowLibrary) -> Result<Generated, String> {
         text.push_str(&format!(
             "println(\"{n} = \", result.posteriors[:{n}]{last})\n"
         ));
+        // A plated variable is a vector of posteriors: one mean each.
+        let dot = if s.out.plate.is_some() { "." } else { "" };
         text.push_str(&format!(
-            "println(\"mean({n}) = \", mean(result.posteriors[:{n}]{last}))\n"
+            "println(\"mean({n}) = \", mean{dot}(result.posteriors[:{n}]{last}))\n"
         ));
     }
 
@@ -1196,5 +1343,183 @@ mod tests {
         assert!(generate(&f, &lib)
             .unwrap_err()
             .contains("not a Julia variable name"));
+    }
+
+    fn plate(id: &str, index: &str, size: &str) -> moonkale_ext_api::flow::Plate {
+        moonkale_ext_api::flow::Plate {
+            id: id.into(),
+            index: index.into(),
+            size: size.into(),
+            parent: None,
+        }
+    }
+
+    /// The coin with its flips in a plate: drawn once, `i = 1…n`.
+    pub(super) fn plated_coin() -> Flow {
+        let mut f = coin();
+        f.plates = vec![plate("p", "i", "")];
+        for id in ["flip", "y"] {
+            f.blocks.iter_mut().find(|b| b.id == id).unwrap().plate = Some("p".into());
+        }
+        f
+    }
+
+    #[test]
+    fn an_iid_plate_loops_over_its_data() {
+        let lib = crate::rxinfer::library();
+        assert!(validate(&plated_coin(), std::slice::from_ref(&lib)).is_empty());
+        let g = generate(&plated_coin(), &lib).unwrap();
+        assert!(
+            g.text.contains("@model function factor_graph(y)"),
+            "{}",
+            g.text
+        );
+        assert!(
+            g.text
+                .contains("    for i in eachindex(y)\n        y[i] ~ Bernoulli(θ)\n    end\n"),
+            "{}",
+            g.text
+        );
+        assert!(g.text.contains("y = [1.0, 1.0, 0.0"), "{}", g.text);
+        // A stated size must match the data.
+        let mut f = plated_coin();
+        f.plates[0].size = "10".into();
+        assert!(generate(&f, &lib).unwrap().text.contains("for i in 1:10"));
+        f.plates[0].size = "9".into();
+        assert!(generate(&f, &lib)
+            .unwrap_err()
+            .contains("size 9, but y has 10"));
+    }
+
+    /// μ ~ Normal, τ ~ Gamma; z[i] ~ Normal(μ, 1), y[i] ~ Normal(z[i], τ⁻¹)
+    /// — a latent per-instance variable, which only a plate can say.
+    pub(super) fn hierarchical() -> Flow {
+        let mut f = Flow::new();
+        f.blocks = vec![
+            block("pm", "normal", &[("variance", "100.0")]),
+            block("mu", "variable", &[("name", "mu")]),
+            block("pt", "gamma", &[]),
+            block("tau", "variable", &[("name", "tau")]),
+            block("fz", "normal", &[]),
+            block("z", "variable", &[("name", "z")]),
+            block("fy", "normal_precision", &[]),
+            block("y", "variable", &[("name", "y"), ("data", "1.0, 2.0, 3.0")]),
+        ];
+        for id in ["fz", "z", "fy", "y"] {
+            f.blocks.iter_mut().find(|b| b.id == id).unwrap().plate = Some("p".into());
+        }
+        f.plates = vec![plate("p", "i", "")];
+        f.wires = vec![
+            wire("w1", "pm", "out", "mu", "x"),
+            wire("w2", "pt", "out", "tau", "x"),
+            wire("w3", "mu", "x", "fz", "mean"),
+            wire("w4", "fz", "out", "z", "x"),
+            wire("w5", "z", "x", "fy", "mean"),
+            wire("w6", "tau", "x", "fy", "precision"),
+            wire("w7", "fy", "out", "y", "x"),
+        ];
+        f
+    }
+
+    #[test]
+    fn a_latent_variable_in_a_plate_is_indexed() {
+        let lib = crate::rxinfer::library();
+        assert!(
+            validate(&hierarchical(), std::slice::from_ref(&lib)).is_empty(),
+            "{:?}",
+            validate(&hierarchical(), std::slice::from_ref(&lib))
+        );
+        let g = generate(&hierarchical(), &lib).unwrap();
+        let t = &g.text;
+        assert!(t.contains("        z[i] ~ Normal(mean = mu, variance = 1.0)\n        y[i] ~ Normal(mean = z[i], precision = tau)\n"), "{t}");
+        assert_eq!(t.matches("for i in eachindex(y)").count(), 1, "{t}");
+        assert!(t.contains("q(z) = vague(NormalMeanVariance)"), "{t}");
+        assert!(t.contains("mean.(result.posteriors[:z][end])"), "{t}");
+        assert!(t.contains("mean(result.posteriors[:mu][end])"), "{t}");
+    }
+
+    #[test]
+    fn plates_it_cannot_generate_are_refused_with_the_reason() {
+        let lib = crate::rxinfer::library();
+        // The likelihood outside the plate of its data: validate and
+        // codegen say why.
+        let mut f = plated_coin();
+        f.blocks.iter_mut().find(|b| b.id == "flip").unwrap().plate = None;
+        assert!(generate(&f, &lib).unwrap_err().contains("y is one per i"));
+        assert!(validate(&f, std::slice::from_ref(&lib))
+            .iter()
+            .any(|i| i.message.contains("y is one per i")));
+        // A factor in a plate drawing a variable outside it.
+        let mut f = plated_coin();
+        f.blocks.iter_mut().find(|b| b.id == "y").unwrap().plate = None;
+        assert!(generate(&f, &lib)
+            .unwrap_err()
+            .contains("must be in the plate too"));
+        // Nested.
+        let mut f = plated_coin();
+        f.plates.push(plate("q", "j", "2"));
+        f.plates[0].parent = Some("q".into());
+        assert!(generate(&f, &lib).unwrap_err().contains("nested plates"));
+        // Data-sized with nothing observed.
+        let mut f = hierarchical();
+        f.blocks
+            .iter_mut()
+            .find(|b| b.id == "y")
+            .unwrap()
+            .params
+            .remove("data");
+        f.blocks
+            .push(block("o", "variable", &[("name", "o"), ("data", "1.0")]));
+        f.blocks.push(block("fo", "normal", &[]));
+        f.wires.push(wire("w8", "fo", "out", "o", "x"));
+        f.wires.push(wire("w9", "mu", "x", "fo", "mean"));
+        assert!(generate(&f, &lib).unwrap_err().contains("give it a size"));
+        // An all-underscore index cannot be read back (review, Codex #6).
+        let mut f = plated_coin();
+        f.plates[0].index = "_".into();
+        assert!(generate(&f, &lib).unwrap_err().contains("not a Julia name"));
+        // The index taken by a variable.
+        let mut f = plated_coin();
+        f.plates[0].index = "y".into();
+        assert!(generate(&f, &lib)
+            .unwrap_err()
+            .contains("also a variable's name"));
+    }
+
+    #[test]
+    fn units_and_spaces_are_refused_in_the_editor() {
+        let lib = crate::rxinfer::library();
+        let mut f = hierarchical();
+        let set = |f: &mut Flow, id: &str, k: &str, v: &str| {
+            f.blocks
+                .iter_mut()
+                .find(|b| b.id == id)
+                .unwrap()
+                .params
+                .insert(k.into(), v.into());
+        };
+        set(&mut f, "mu", "unit", "m");
+        set(&mut f, "z", "unit", "m");
+        set(&mut f, "tau", "unit", "m^-2");
+        set(&mut f, "y", "unit", "m");
+        assert!(
+            validate(&f, std::slice::from_ref(&lib)).is_empty(),
+            "{:?}",
+            validate(&f, std::slice::from_ref(&lib))
+        );
+        set(&mut f, "y", "unit", "s");
+        let issues = validate(&f, std::slice::from_ref(&lib));
+        assert!(
+            issues.iter().any(|i| i.message.contains("units disagree")),
+            "{issues:?}"
+        );
+        // A count is no probability.
+        let mut c = coin();
+        set(&mut c, "theta", "space", "count");
+        let issues = validate(&c, &[lib]);
+        assert!(
+            issues.iter().any(|i| i.message.contains("do not meet")),
+            "{issues:?}"
+        );
     }
 }

@@ -294,6 +294,7 @@ fn flatten(flow: &Flow, prefix: &str) -> Result<Flat, String> {
 }
 
 pub fn generate(flow: &Flow, lib: &FlowLibrary) -> Result<Generated, String> {
+    crate::codegen::refuse_plates(flow, "ModelingToolkit")?;
     let prefix = format!("{}/", lib.id);
 
     // Subflow instances flatten first (ADR-0021 §6): the generator below
@@ -838,6 +839,7 @@ mod tests {
                 w("iw2", "res-x", "n", "cap-x", "p"),
                 w("iw3", "cap-x", "n", "boundary/out", "out"),
             ],
+            plates: vec![],
         }];
         f.blocks = vec![
             b("src-aa", "voltage", &[("V", "1.0")]),
@@ -946,6 +948,7 @@ mod tests {
                     to_port: "out".into(),
                 },
             ],
+            plates: vec![],
         });
         f.blocks.push(Block {
             id: "rc-2".into(),
@@ -1078,6 +1081,7 @@ mod tests {
                     to_port: "out".into(),
                 },
             ],
+            plates: vec![],
         });
         f.blocks[1].subflow = Some("stage".into());
         let out = generate(&f, &lib).expect("flattens");
