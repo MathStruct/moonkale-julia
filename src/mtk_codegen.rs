@@ -824,6 +824,7 @@ mod tests {
         };
         f.subflows = vec![Subflow {
             id: "rc_filter".into(),
+            role: None,
             name: "RC filter".into(),
             inputs: vec![],
             outputs: vec![],
@@ -903,6 +904,7 @@ mod tests {
         // A second instance of the same subflow: a divider of two halves.
         f.subflows.push(Subflow {
             id: "half".into(),
+            role: None,
             name: "Half".into(),
             inputs: vec![],
             outputs: vec![],
@@ -1049,6 +1051,7 @@ mod tests {
         let pins = f.subflows[0].connections.clone();
         f.subflows.push(Subflow {
             id: "stage".into(),
+            role: None,
             name: "Stage".into(),
             inputs: vec![],
             outputs: vec![],
